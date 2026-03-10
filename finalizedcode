@@ -1,0 +1,971 @@
+#include "thingProperties.h"
+#include <Wire.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// PINS
+static const int I2C0_SDA = 16;
+static const int I2C0_SCL = 17;
+
+static const int RELAY1_PIN = 18;            // GRID
+static const int RELAY2_PIN = 19;            // RENEWABLE / BATTERY PATH
+static const bool RELAY_ACTIVE_LOW = false;
+
+// Fan control
+static const int FAN_PWM_PIN  = 23;
+static const int FAN_TACH_PIN = 34;
+
+// FAN PWM (LEDC)
+static const int FAN_PWM_CH   = 0;
+static const int FAN_PWM_FREQ = 25000;
+static const int FAN_PWM_RES  = 8;           
+static const bool FAN_PWM_INVERT = true;
+
+// Tach
+static const int TACH_PULSES_PER_REV = 2;
+static const unsigned long RPM_SAMPLE_MS = 2000;
+unsigned long lastRpmSample = 0;
+volatile uint32_t tachPulses = 0;
+
+// INA226 ADDRESSES
+static const uint8_t INA_ADDR_LOAD  = 0x44;
+static const uint8_t INA_ADDR_GRID  = 0x45;
+static const uint8_t INA_ADDR_BATT  = 0x40;
+
+// INA226 registers
+static const uint8_t REG_CONFIG      = 0x00;
+static const uint8_t REG_BUS_VOLT    = 0x02;
+static const uint8_t REG_CURRENT     = 0x04;
+static const uint8_t REG_CALIBRATION = 0x05;
+static const uint8_t REG_MANUF_ID    = 0xFE;
+static const uint8_t REG_DIE_ID      = 0xFF;
+
+// Shunts
+static const float SHUNT_OHMS_LOAD  = 0.003f;
+static const float SHUNT_OHMS_GRID  = 0.00308f;
+static const float SHUNT_OHMS_BATT  = 0.002f;
+
+static const float CURRENT_LSB_A = 0.002f;
+
+static uint16_t calLoad  = 0;
+static uint16_t calGrid  = 0;
+static uint16_t calBatt  = 0;
+
+// TELEMETRY SAMPLING
+static const unsigned long SAMPLE_MS = 1000;
+unsigned long lastSample = 0;
+static unsigned long lastTickMs = 0;
+
+// BOOT HOLD
+static const unsigned long BOOT_HOLDOFF_MS = 4000;
+static unsigned long bootStartMs = 0;
+static bool bootHold = true;
+
+// HELPERS
+static inline float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static inline float roundTo(float x, float step) {
+  if (step <= 0) return x;
+  return roundf(x / step) * step;
+}
+
+static inline void zeroSolarTelemetry() {
+  solarVoltage_V = 0.0f;
+  solarCurrent_A = 0.0f;
+  solarPower_W   = 0.0f;
+}
+
+// FACILITY SCALE
+static inline float facilityScaleSafe() {
+  float s = facilityScale;
+  if (!isfinite(s)) s = 1.0f;
+  s = roundf(s);
+  if (s < 1.0f)  s = 1.0f;
+  if (s > 50.0f) s = 50.0f;
+  return s;
+}
+
+void onFacilityScaleChange() {
+  if (!isfinite(facilityScale)) facilityScale = 1.0f;
+  facilityScale = roundf(facilityScale);
+  if (facilityScale < 1.0f) facilityScale = 1.0f;
+  if (facilityScale > 50.0f) facilityScale = 50.0f;
+}
+
+// FAULT / WARNING
+static bool g_appliedR1 = false;
+static bool g_appliedR2 = false;
+static unsigned long g_bothOffSinceMs = 0;
+
+static unsigned long g_overCurSinceMs = 0;
+static const float LOAD_OC_A = 6.0f;
+static const unsigned long LOAD_OC_PERSIST_MS = 1500;
+
+static bool   warnActive = false;
+static String warnReason = "";
+
+static inline void setWarn(const String& r) { warnActive = true;  warnReason = r; }
+static inline void clearWarn()              { warnActive = false; warnReason = ""; }
+
+static const unsigned long NO_SOURCE_WARN_MS = 3000;
+static const float NO_SOURCE_I_A = 0.10f;
+
+static inline void trackAppliedRelays(unsigned long now, bool r1, bool r2) {
+  g_appliedR1 = r1;
+  g_appliedR2 = r2;
+
+  if (!r1 && !r2) {
+    if (g_bothOffSinceMs == 0) g_bothOffSinceMs = now;
+  } else {
+    g_bothOffSinceMs = 0;
+  }
+}
+
+// RELAY HELPERS
+static inline void setRelayPinRaw(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) digitalWrite(pin, on ? LOW : HIGH);
+  else                  digitalWrite(pin, on ? HIGH : LOW);
+}
+
+static inline void allRelaysOff() {
+  setRelayPinRaw(RELAY1_PIN, false);
+  setRelayPinRaw(RELAY2_PIN, false);
+}
+
+static unsigned long lastSwitchMs = 0;
+static const unsigned long MIN_DWELL_MS_MANUAL = 2500;
+static const unsigned long MIN_DWELL_MS_AUTO   = 600;
+static const unsigned long BREAK_BEFORE_MAKE_MS = 150;
+
+void applySourceRelaysSafe() {
+  unsigned long now = millis();
+
+  bool reqR1 = relay1_on;
+  bool reqR2 = relay2_on;
+
+  if (reqR1 && reqR2) {
+    reqR2 = false;
+    relay2_on = false;
+  }
+
+  static bool appliedR1 = false, appliedR2 = false;
+  static bool pendingValid = false;
+  static bool pendR1 = false, pendR2 = false;
+
+  if (reqR1 != appliedR1 || reqR2 != appliedR2) {
+    pendR1 = reqR1;
+    pendR2 = reqR2;
+    pendingValid = true;
+  }
+
+  unsigned long dwell = autoMode ? MIN_DWELL_MS_AUTO : MIN_DWELL_MS_MANUAL;
+
+  if ((now - lastSwitchMs) < dwell) {
+    relay1_on = appliedR1;
+    relay2_on = appliedR2;
+    setRelayPinRaw(RELAY1_PIN, appliedR1);
+    setRelayPinRaw(RELAY2_PIN, appliedR2);
+    trackAppliedRelays(now, appliedR1, appliedR2);
+    return;
+  }
+
+  if (!pendingValid) {
+    setRelayPinRaw(RELAY1_PIN, appliedR1);
+    setRelayPinRaw(RELAY2_PIN, appliedR2);
+    relay1_on = appliedR1;
+    relay2_on = appliedR2;
+    trackAppliedRelays(now, appliedR1, appliedR2);
+    return;
+  }
+
+  allRelaysOff();
+  delay(BREAK_BEFORE_MAKE_MS);
+
+  setRelayPinRaw(RELAY1_PIN, pendR1);
+  setRelayPinRaw(RELAY2_PIN, pendR2);
+
+  appliedR1 = pendR1;
+  appliedR2 = pendR2;
+  relay1_on = appliedR1;
+  relay2_on = appliedR2;
+
+  pendingValid = false;
+  lastSwitchMs = now;
+
+  trackAppliedRelays(now, appliedR1, appliedR2);
+}
+
+// FAN PWM + TACH
+static float g_fanAppliedPct = 0.0f;
+static bool  g_fanGuard = false;
+
+static inline uint32_t dutyPctToCounts(float pct) {
+  pct = clampf(pct, 0.0f, 100.0f);
+  const uint32_t maxCounts = (1u << FAN_PWM_RES) - 1u;
+  uint32_t counts = (uint32_t)((pct / 100.0f) * maxCounts + 0.5f);
+  if (FAN_PWM_INVERT) counts = maxCounts - counts;
+  return counts;
+}
+
+static void setFanDutyApplied(float appliedPct) {
+  g_fanAppliedPct = clampf(appliedPct, 0.0f, 100.0f);
+  ledcWrite(FAN_PWM_CH, dutyPctToCounts(g_fanAppliedPct));
+
+  g_fanGuard = true;
+  fanDuty_pct = g_fanAppliedPct;
+  g_fanGuard = false;
+}
+
+void onFanDutyPctChange() {
+  if (g_fanGuard) return;
+  setFanDutyApplied(fanDuty_pct);
+}
+
+void IRAM_ATTR tachISR() {
+  tachPulses++;
+}
+
+// INA226 HELPERS + I2C SCAN
+bool ina226_write16(TwoWire &bus, uint8_t addr, uint8_t reg, uint16_t val) {
+  bus.beginTransmission(addr);
+  bus.write(reg);
+  bus.write((uint8_t)(val >> 8));
+  bus.write((uint8_t)(val & 0xFF));
+  return (bus.endTransmission() == 0);
+}
+
+bool ina226_read16(TwoWire &bus, uint8_t addr, uint8_t reg, uint16_t &out) {
+  bus.beginTransmission(addr);
+  bus.write(reg);
+  if (bus.endTransmission(false) != 0) return false;
+  bus.requestFrom(addr, (uint8_t)2);
+  if (bus.available() < 2) return false;
+  uint16_t msb = bus.read();
+  uint16_t lsb = bus.read();
+  out = (msb << 8) | lsb;
+  return true;
+}
+
+uint16_t ina226_calcCal(float shuntOhms) {
+  float cal_f = 0.00512f / (CURRENT_LSB_A * shuntOhms);
+  if (cal_f > 65535.0f) cal_f = 65535.0f;
+  return (uint16_t)(cal_f + 0.5f);
+}
+
+bool ina226_init(TwoWire &bus, uint8_t addr, float shuntOhms, uint16_t &calOut) {
+  if (!ina226_write16(bus, addr, REG_CONFIG, 0x4527)) return false;
+  calOut = ina226_calcCal(shuntOhms);
+  return ina226_write16(bus, addr, REG_CALIBRATION, calOut);
+}
+
+bool ina226_readVI(TwoWire &bus, uint8_t addr, float &busV, float &currentA) {
+  uint16_t rawBus, rawCurU;
+  if (!ina226_read16(bus, addr, REG_BUS_VOLT, rawBus)) return false;
+  if (!ina226_read16(bus, addr, REG_CURRENT, rawCurU)) return false;
+  busV = rawBus * 0.00125f;
+  currentA = (int16_t)rawCurU * CURRENT_LSB_A;
+  return true;
+}
+
+static void scanI2C() {
+  Serial.println("\n=== I2C SCAN (Wire) ===");
+  int found = 0;
+
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.print("  Found 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+
+      uint16_t mid = 0, did = 0;
+      bool okMid = ina226_read16(Wire, addr, REG_MANUF_ID, mid);
+      bool okDid = ina226_read16(Wire, addr, REG_DIE_ID, did);
+      if (okMid && okDid) {
+        Serial.print("  (INA226? MID=0x");
+        Serial.print(mid, HEX);
+        Serial.print(" DID=0x");
+        Serial.print(did, HEX);
+        Serial.print(")");
+      }
+      Serial.println();
+      found++;
+    }
+  }
+
+  if (!found) Serial.println("  (none)");
+}
+
+// BATTERY SOC
+float estimateSLA_SOC(float vBatt) {
+  const float V_EMPTY = 11.8f;
+  const float V_FULL  = 12.7f;
+  float soc = (vBatt - V_EMPTY) * 100.0f / (V_FULL - V_EMPTY);
+  return clampf(soc, 0.0f, 100.0f);
+}
+
+static float battV_filt = NAN;
+static float battSOC_hold = 0.0f;
+static const float BATT_REST_I_A = 0.05f;
+static const float BATT_V_ALPHA  = 0.15f;
+
+// SIM CLOCK + 12h FORMAT
+static float simHour_f = 12.0f;
+static double g_simTimeTotal_h = 0.0;
+
+String formatTime12FromHourFloat(float hourFloat) {
+  while (hourFloat >= 24.0f) hourFloat -= 24.0f;
+  while (hourFloat < 0.0f)   hourFloat += 24.0f;
+
+  int h24 = (int)floorf(hourFloat);
+  float frac = hourFloat - (float)h24;
+  int minutes = (int)lroundf(frac * 60.0f);
+  if (minutes >= 60) {
+    minutes = 0;
+    h24 = (h24 + 1) % 24;
+  }
+
+  int h12 = h24 % 12;
+  if (h12 == 0) h12 = 12;
+  const char* ap = (h24 < 12) ? "AM" : "PM";
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d:%02d %s", h12, minutes, ap);
+  return String(buf);
+}
+
+void updateSimTime12hCloud() {
+  simTime12h = formatTime12FromHourFloat(simHour_f);
+}
+
+void applyJumpHour(int h) {
+  h = (h < 0) ? 0 : (h > 23 ? 23 : h);
+  simHour_f = (float)h;
+  simHour = h;
+  updateSimTime12hCloud();
+}
+
+// PRICING
+static const float CHI_OFFPEAK = 0.16f;
+static const float CHI_PEAK    = 0.22f;
+static const float RIV_OFFPEAK = 0.22f;
+static const float RIV_PEAK    = 0.55f;
+
+static inline bool isPeakHour(int hour) {
+  if (tariffProfile == 1) return (hour >= 16 && hour <= 20);
+  return ((hour >= 7 && hour <= 9) || (hour >= 17 && hour <= 19));
+}
+
+static inline float getPrice(int hour) {
+  hour = (hour < 0) ? 0 : (hour > 23 ? 23 : hour);
+  if (tariffProfile == 1) return isPeakHour(hour) ? RIV_PEAK : RIV_OFFPEAK;
+  return isPeakHour(hour) ? CHI_PEAK : CHI_OFFPEAK;
+}
+
+static inline const char* getCityName() {
+  return (tariffProfile == 1) ? "Riverside (Summer)" : "Chicago (Winter)";
+}
+
+static inline const char* getBandName(int hour) {
+  return isPeakHour(hour) ? "PEAK" : "OFF-PEAK";
+}
+
+// DEMAND SHAPE
+static float demandFactorByProfile(int hour) {
+  if (tariffProfile == 1) {
+    if (hour < 8)   return 0.30f;
+    if (hour < 13)  return 0.60f;
+    if (hour < 16)  return 0.90f;
+    if (hour < 21)  return 1.00f;
+    return 0.70f;
+  } else {
+    if (hour < 6)   return 0.40f;
+    if (hour < 9)   return 0.90f;
+    if (hour < 16)  return 0.30f;
+    if (hour < 21)  return 1.00f;
+    return 0.50f;
+  }
+}
+
+// THERMAL PRE-COOL / PRE-HEAT
+static float thermalReserve = 0.0f;
+
+static void updateThermalReserve(float simDtHours, float speedFrac) {
+  if (simDtHours <= 0) return;
+
+  thermalReserve -= 0.04f * simDtHours;
+  if (thermalReserve < 0) thermalReserve = 0;
+
+  const bool peak = isPeakHour(simHour);
+
+  if (tariffProfile == 1) {
+    bool pre = (simHour >= 13 && simHour < 16) && !peak;
+    if (pre)  thermalReserve += 0.25f * simDtHours * speedFrac;
+    if (peak) thermalReserve -= 0.30f * simDtHours * speedFrac;
+  } else {
+    bool pre = ((simHour >= 6 && simHour < 7) || (simHour >= 16 && simHour < 17)) && !peak;
+    if (pre)  thermalReserve += 0.22f * simDtHours * speedFrac;
+    if (peak) thermalReserve -= 0.28f * simDtHours * speedFrac;
+  }
+
+  thermalReserve = clampf(thermalReserve, 0.0f, 1.0f);
+}
+
+// FAN AUTO
+static const float FAN_RAMP_PCT_PER_SIM_HOUR = 60.0f;
+
+static float fanTargetAppliedPct(int hour) {
+  float baseDemand = demandFactorByProfile(hour);
+
+  if (isPeakHour(hour)) {
+    baseDemand = fmaxf(0.20f, baseDemand - 0.45f * thermalReserve);
+  }
+
+  bool battLow = (batterySOC_pct < 30.0f);
+  if (battLow && isPeakHour(hour)) baseDemand *= 0.80f;
+
+  float minPct = (tariffProfile == 1) ? 15.0f : 20.0f;
+  float maxPct = 95.0f;
+
+  if (tariffProfile == 1 && hour == 15) baseDemand = fmaxf(baseDemand, 0.95f);
+  if (tariffProfile == 0 && hour == 6)  baseDemand = fmaxf(baseDemand, 0.85f);
+
+  return minPct + clampf(baseDemand, 0.0f, 1.0f) * (maxPct - minPct);
+}
+
+static void updateFanAuto(float simDtHours) {
+  if (!autoMode) return;
+
+  float target = fanTargetAppliedPct(simHour);
+  float maxStep = FAN_RAMP_PCT_PER_SIM_HOUR * simDtHours;
+  if (maxStep < 0.1f) maxStep = 0.1f;
+
+  float diff = target - g_fanAppliedPct;
+  if (fabsf(diff) > maxStep) diff = (diff > 0) ? maxStep : -maxStep;
+
+  setFanDutyApplied(g_fanAppliedPct + diff);
+}
+
+// VIRTUAL HOME LOAD MODEL
+static const float ALWAYS_ON_W      = 120.0f;
+static const float FRIDGE_ON_W      = 150.0f;
+static const float LIGHTS_W         = 120.0f;
+static const float HVAC_EXP         = 1.7f;
+
+static const float HVAC_MAX_CHI_W   = 900.0f;
+static const float HVAC_MAX_RIV_W   = 2500.0f;
+
+static inline int simMinuteOfDay() {
+  float hf = simHour_f;
+  while (hf >= 24.0f) hf -= 24.0f;
+  while (hf < 0.0f)   hf += 24.0f;
+  int h = (int)floorf(hf);
+  int m = (int)lroundf((hf - (float)h) * 60.0f);
+  if (m >= 60) {
+    m = 0;
+    h = (h + 1) % 24;
+  }
+  return h * 60 + m;
+}
+
+static float computeLights_W(float scale) {
+  int h = simHour;
+  bool on = (tariffProfile == 1) ? (h >= 19 && h <= 23) : (h >= 17 && h <= 23);
+  return on ? (LIGHTS_W * scale) : 0.0f;
+}
+
+static float computeFridge_W(float scale) {
+  int mod = simMinuteOfDay() % 30;
+  bool on = (mod < 10);
+  return on ? (FRIDGE_ON_W * scale) : 0.0f;
+}
+
+static float computeMisc_W(float scale) {
+  int h = simHour;
+  float misc = 120.0f;
+  if (h >= 6 && h <= 8)   misc = 250.0f;
+  if (h >= 9 && h <= 16)  misc = 150.0f;
+  if (h >= 17 && h <= 22) misc = 350.0f;
+  return misc * scale;
+}
+
+static const float FAN_RPM_NOMINAL_MAX = 1800.0f;
+
+static float fanSpeedFrac() {
+  if (fanRPM > 50) return clampf((float)fanRPM / FAN_RPM_NOMINAL_MAX, 0.0f, 1.0f);
+  return clampf(g_fanAppliedPct / 100.0f, 0.0f, 1.0f);
+}
+
+static float computeHvac_W(float scale) {
+  float df = demandFactorByProfile(simHour);
+  if (isPeakHour(simHour)) df = fmaxf(0.20f, df - 0.45f * thermalReserve);
+
+  float hvacMax = (tariffProfile == 1) ? HVAC_MAX_RIV_W : HVAC_MAX_CHI_W;
+
+  float s = fanSpeedFrac();
+  float hvac = hvacMax * df * powf(s, HVAC_EXP);
+  return hvac * scale;
+}
+
+static float computeFacilityLoad_W() {
+  float scale = facilityScaleSafe();
+  float base   = ALWAYS_ON_W * scale;
+  float fridge = computeFridge_W(scale);
+  float lights = computeLights_W(scale);
+  float misc   = computeMisc_W(scale);
+  float hvac   = computeHvac_W(scale);
+  return base + fridge + lights + misc + hvac;
+}
+
+// ENERGY + COST
+static double eGrid_kWh_acc  = 0.0;
+static double eRenew_kWh_acc = 0.0;
+static double eTotal_kWh_acc = 0.0;
+static double costBaseline_acc = 0.0;
+static double costActual_acc   = 0.0;
+
+static double dayGrid_kWh_acc  = 0.0;
+static double dayRenew_kWh_acc = 0.0;
+static double dayEnergy_kWh_acc = 0.0;
+static double dayCostBaseline_acc = 0.0;
+static double dayCostActual_acc   = 0.0;
+static int simDayCounter = 1;
+
+void publishEnergyCostRounded() {
+  energyGrid_kWh   = roundTo((float)eGrid_kWh_acc,  0.001f);
+  energyRenew_kWh  = roundTo((float)eRenew_kWh_acc, 0.001f);
+  energyTotal_kWh  = roundTo((float)eTotal_kWh_acc, 0.001f);
+
+  costBaseline_USD = roundTo((float)costBaseline_acc, 0.001f);
+  costActual_USD   = roundTo((float)costActual_acc,   0.001f);
+  costSavings_USD  = roundTo(costBaseline_USD - costActual_USD, 0.001f);
+}
+
+void publishDayBucketRounded() {
+  dayGrid_kWh  = roundTo((float)dayGrid_kWh_acc,  0.001f);
+  dayRenew_kWh = roundTo((float)dayRenew_kWh_acc, 0.001f);
+  dayEnergy_kWh = roundTo((float)dayEnergy_kWh_acc, 0.001f);
+
+  dayCostBaseline_USD = roundTo((float)dayCostBaseline_acc, 0.001f);
+  dayCostActual_USD   = roundTo((float)dayCostActual_acc,   0.001f);
+  daySavings_USD      = roundTo(dayCostBaseline_USD - dayCostActual_USD, 0.001f);
+
+  simDay = simDayCounter;
+}
+
+void resetEnergyAndCost() {
+  eGrid_kWh_acc = eRenew_kWh_acc = eTotal_kWh_acc = 0.0;
+  costBaseline_acc = costActual_acc = 0.0;
+
+  dayGrid_kWh_acc = dayRenew_kWh_acc = dayEnergy_kWh_acc = 0.0;
+  dayCostBaseline_acc = dayCostActual_acc = 0.0;
+
+  simDayCounter = 1;
+  simDay = simDayCounter;
+
+  publishEnergyCostRounded();
+  publishDayBucketRounded();
+}
+
+void finalizeSimDay() {
+  publishDayBucketRounded();
+
+  dayGrid_kWh_acc = dayRenew_kWh_acc = dayEnergy_kWh_acc = 0.0;
+  dayCostBaseline_acc = dayCostActual_acc = 0.0;
+
+  simDayCounter++;
+  simDay = simDayCounter;
+}
+
+void accumulateEnergyCostSim(double simDtHours, float loadPowerW, float price) {
+  if (simDtHours <= 0.0) return;
+
+  float pW = loadPowerW;
+  if (!isfinite(pW)) pW = 0;
+  if (pW < 0) pW = -pW;
+
+  double dE_kWh = ((double)pW * simDtHours) / 1000.0;
+  if (dE_kWh < 0) dE_kWh = 0;
+
+  costBaseline_acc += dE_kWh * (double)price;
+
+  bool usingGrid  = relay1_on && !relay2_on;
+  bool usingRenew = relay2_on && !relay1_on;
+
+  if (usingGrid) {
+    eGrid_kWh_acc += dE_kWh;
+    costActual_acc += dE_kWh * (double)price;
+  } else if (usingRenew) {
+    eRenew_kWh_acc += dE_kWh;
+  }
+  eTotal_kWh_acc = eGrid_kWh_acc + eRenew_kWh_acc;
+
+  dayCostBaseline_acc += dE_kWh * (double)price;
+  dayEnergy_kWh_acc   += dE_kWh;
+
+  if (usingGrid) {
+    dayGrid_kWh_acc += dE_kWh;
+    dayCostActual_acc += dE_kWh * (double)price;
+  } else if (usingRenew) {
+    dayRenew_kWh_acc += dE_kWh;
+  }
+
+  publishEnergyCostRounded();
+}
+
+float advanceSimClock(unsigned long dtMs) {
+  if (!simRun) {
+    updateSimTime12hCloud();
+    return 0.0f;
+  }
+
+  float dt_min = (float)dtMs / 60000.0f;
+  float spd = clampf(simSpeed_hoursPerMin, 0.0f, 120.0f);
+
+  float simDtHours = spd * dt_min;
+  simHour_f += simDtHours;
+
+  while (simHour_f >= 24.0f) {
+    simHour_f -= 24.0f;
+    finalizeSimDay();
+  }
+  while (simHour_f < 0.0f) {
+    simHour_f += 24.0f;
+  }
+
+  simHour = ((int)floor(simHour_f)) % 24;
+  updateSimTime12hCloud();
+  return simDtHours;
+}
+
+// FAULTS + AUTO DECISION
+void setFault(const String &reason) {
+  faultActive = true;
+  faultReason = reason;
+}
+
+void clearFault() {
+  faultActive = false;
+  faultReason = "";
+  g_overCurSinceMs = 0;
+  clearWarn();
+}
+
+static const float  DECISION_CONFIRM_SIM_MIN = 5.0f;
+static const double DECISION_CONFIRM_SIM_H   = (double)DECISION_CONFIRM_SIM_MIN / 60.0;
+
+static bool   latchedWantRenew    = false;
+static bool   lastCandidateRenew  = false;
+static double candidateSinceSim_h = 0.0;
+
+static const float BATT_ENTER_SOC = 35.0f;
+static const float BATT_EXIT_SOC  = 25.0f;
+static const float BATT_ENTER_V   = 12.20f;
+static const float BATT_EXIT_V    = 12.00f;
+
+static inline bool batteryOkForDischargeHyst(bool usingRenewNow) {
+  if (!usingRenewNow) return (batterySOC_pct >= BATT_ENTER_SOC) && (batteryVoltage_V >= BATT_ENTER_V);
+  return (batterySOC_pct >= BATT_EXIT_SOC) && (batteryVoltage_V >= BATT_EXIT_V);
+}
+
+void updateAutoDecision(float loadPowerW) {
+  float price = getPrice(simHour);
+  gridPrice_dperkWh = roundTo(price, 0.001f);
+  rateBand = String(getBandName(simHour));
+
+  float lp = fabs(loadPowerW);
+  bool usingRenewNow = (relay2_on && !relay1_on);
+  bool inPeak = isPeakHour(simHour);
+
+  bool battOk = batteryOkForDischargeHyst(usingRenewNow);
+  bool candidateRenew = (battOk && inPeak);
+
+  double tSim = g_simTimeTotal_h;
+  if (candidateRenew != lastCandidateRenew) {
+    lastCandidateRenew = candidateRenew;
+    candidateSinceSim_h = tSim;
+  }
+
+  if ((tSim - candidateSinceSim_h) >= DECISION_CONFIRM_SIM_H) {
+    latchedWantRenew = candidateRenew;
+  }
+
+  relay1_on = !latchedWantRenew;
+  relay2_on =  latchedWantRenew;
+
+  const char* srcStr = latchedWantRenew ? "RENEW" : "GRID";
+  emsState = String("AUTO | ") + getCityName() + " | " + rateBand +
+             " | " + simTime12h +
+             " | $" + String(price, 3) + "/kWh | SRC=" + srcStr +
+             " | Load=" + String(lp, 0) + "W" +
+             " | Fan=" + String(g_fanAppliedPct, 0) + "%";
+}
+
+// CLOUD CALLBACKS
+void onRelay1OnChange() {
+  if (bootHold) { relay1_on = false; relay2_on = false; return; }
+  if (autoMode) return;
+  if (relay1_on) relay2_on = false;
+  applySourceRelaysSafe();
+}
+
+void onRelay2OnChange() {
+  if (bootHold) { relay1_on = false; relay2_on = false; return; }
+  if (autoMode) return;
+  if (relay2_on) relay1_on = false;
+  applySourceRelaysSafe();
+}
+
+void onTariffProfileChange() {
+  if (tariffProfile < 0) tariffProfile = 0;
+  if (tariffProfile > 1) tariffProfile = 1;
+}
+
+void onAutoModeChange() {}
+
+void onSimRunChange() {
+  lastTickMs = millis();
+}
+
+void onSimJumpHourChange() {
+  if (simJumpHour < 0) simJumpHour = 0;
+  if (simJumpHour > 23) simJumpHour = 23;
+  applyJumpHour(simJumpHour);
+  simJumpHour = simHour;
+}
+
+void onSimSpeedHoursPerMinChange() {
+  simSpeed_hoursPerMin = clampf(simSpeed_hoursPerMin, 0.0f, 120.0f);
+}
+
+
+void onSolarSimEnableChange()  {}
+void onSolarSimPctChange()     {}
+void onSolarSimEnabledChange() {}
+
+void onResetEnergyCostChange() {
+  if (resetEnergyCost) {
+    resetEnergyAndCost();
+    resetEnergyCost = false;
+  }
+}
+
+void onFaultResetChange() {
+  if (faultReset) {
+    clearFault();
+    faultReset = false;
+  }
+}
+
+void onAutoControlChange() {}
+
+// SETUP / LOOP
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  initProperties();
+
+  autoMode = false;
+  relay1_on = false;
+  relay2_on = false;
+
+  zeroSolarTelemetry();
+
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  bootStartMs = millis();
+  bootHold = true;
+
+  onFacilityScaleChange();
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  allRelaysOff();
+  trackAppliedRelays(millis(), false, false);
+
+  Wire.begin(I2C0_SDA, I2C0_SCL);
+  Wire.setClock(100000);
+
+  scanI2C();
+
+  ina226_init(Wire, INA_ADDR_LOAD, SHUNT_OHMS_LOAD, calLoad);
+  ina226_init(Wire, INA_ADDR_GRID, SHUNT_OHMS_GRID, calGrid);
+  ina226_init(Wire, INA_ADDR_BATT, SHUNT_OHMS_BATT, calBatt);
+
+  ledcSetup(FAN_PWM_CH, FAN_PWM_FREQ, FAN_PWM_RES);
+  ledcAttachPin(FAN_PWM_PIN, FAN_PWM_CH);
+  setFanDutyApplied(fanDuty_pct);
+
+  pinMode(FAN_TACH_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), tachISR, FALLING);
+  lastRpmSample = millis();
+
+  applyJumpHour(simHour);
+  updateSimTime12hCloud();
+
+  lastTickMs = millis();
+  lastSample = 0;
+
+  emsState = "BOOT";
+  rateBand = "";
+  faultReason = "";
+  faultActive = false;
+
+  g_simTimeTotal_h = 0.0;
+  latchedWantRenew = false;
+  lastCandidateRenew = false;
+  candidateSinceSim_h = 0.0;
+
+  thermalReserve = 0.0f;
+
+  resetEnergyAndCost();
+}
+
+void loop() {
+  ArduinoCloud.update();
+
+  unsigned long now = millis();
+
+  if (bootHold) {
+    if ((now - bootStartMs) < BOOT_HOLDOFF_MS) {
+      autoMode = false;
+      relay1_on = false;
+      relay2_on = false;
+      allRelaysOff();
+      trackAppliedRelays(now, false, false);
+      zeroSolarTelemetry();
+      return;
+    } else {
+      bootHold = false;
+    }
+  }
+
+  if (now - lastRpmSample >= RPM_SAMPLE_MS) {
+    uint32_t pulses;
+    noInterrupts();
+    pulses = tachPulses;
+    tachPulses = 0;
+    interrupts();
+
+    float seconds = (now - lastRpmSample) / 1000.0f;
+    lastRpmSample = now;
+
+    float rpm = (seconds > 0.0f)
+      ? ((pulses / seconds) * (60.0f / (float)TACH_PULSES_PER_REV))
+      : 0.0f;
+
+    fanRPM = (int)(rpm + 0.5f);
+  }
+
+  if (now - lastSample >= SAMPLE_MS) {
+    unsigned long prev = (lastTickMs == 0) ? now : lastTickMs;
+    lastTickMs = now;
+    unsigned long dtMs = now - prev;
+    if (dtMs == 0) dtMs = SAMPLE_MS;
+    lastSample = now;
+
+    float simDtHours = advanceSimClock(dtMs);
+    g_simTimeTotal_h += (double)simDtHours;
+
+    float vLoad = 0, iLoad = 0;
+    if (ina226_readVI(Wire, INA_ADDR_LOAD, vLoad, iLoad)) {
+      loadVoltage_V = vLoad;
+      loadCurrent_A = iLoad;
+    }
+
+    float vGrid = 0, iGrid = 0;
+    if (ina226_readVI(Wire, INA_ADDR_GRID, vGrid, iGrid)) {
+      gridVoltage_V = vGrid;
+      gridCurrent_A = iGrid;
+      gridPower_W   = (vGrid * fabs(iGrid)) * facilityScaleSafe();
+      grid_bus_v    = vGrid;
+    }
+
+    float vBatt = 0, iBatt = 0;
+    if (ina226_readVI(Wire, INA_ADDR_BATT, vBatt, iBatt)) {
+      batteryVoltage_V = vBatt;
+      batteryCurrent_A = iBatt;
+      batteryPower_W   = (vBatt * fabs(iBatt)) * facilityScaleSafe();
+
+      if (isnan(battV_filt)) battV_filt = vBatt;
+      battV_filt = (1.0f - BATT_V_ALPHA) * battV_filt + BATT_V_ALPHA * vBatt;
+
+      if (fabs(iBatt) <= BATT_REST_I_A) battSOC_hold = estimateSLA_SOC(battV_filt);
+      batterySOC_pct = battSOC_hold;
+    }
+
+    // No solar INA in final hardware
+    zeroSolarTelemetry();
+
+    updateThermalReserve(simDtHours, fanSpeedFrac());
+    updateFanAuto(simDtHours);
+
+    loadPower_W = computeFacilityLoad_W();
+
+    float price = getPrice(simHour);
+    gridPrice_dperkWh = roundTo(price, 0.001f);
+    rateBand = String(getBandName(simHour));
+
+    if (!faultActive) {
+      if (g_appliedR1 && g_appliedR2) {
+        setFault("Both relays ON (tie risk)");
+      }
+
+      float iAbs = fabs(loadCurrent_A);
+      if (iAbs > LOAD_OC_A) {
+        if (g_overCurSinceMs == 0) g_overCurSinceMs = now;
+        if ((now - g_overCurSinceMs) >= LOAD_OC_PERSIST_MS) {
+          setFault("Load overcurrent");
+        }
+      } else {
+        g_overCurSinceMs = 0;
+      }
+    }
+
+    bool warnNoSource = false;
+    if (!faultActive && !g_appliedR1 && !g_appliedR2) {
+      if (g_bothOffSinceMs != 0 && (now - g_bothOffSinceMs) >= NO_SOURCE_WARN_MS) {
+        if (fabs(loadCurrent_A) >= NO_SOURCE_I_A) {
+          warnNoSource = true;
+        }
+      }
+    }
+
+    if (warnNoSource) setWarn("Load current present but no source selected");
+    else clearWarn();
+
+    if (faultActive) {
+      emsState = "FAULT | " + faultReason;
+      relay1_on = false;
+      relay2_on = false;
+    } else if (autoMode) {
+      updateAutoDecision(loadPower_W);
+    } else {
+      String src = relay2_on ? "RENEW" : (relay1_on ? "GRID" : "OFF");
+      emsState = "MANUAL | " + String(getCityName()) + " | " + rateBand +
+                 " | " + simTime12h +
+                 " | $" + String(price, 3) + "/kWh | SRC=" + src +
+                 " | Load=" + String(loadPower_W, 0) + "W" +
+                 " | Fan=" + String(g_fanAppliedPct, 0) + "%";
+    }
+
+    if (!faultActive && warnActive) {
+      emsState = "WARN | " + warnReason + " | " + emsState;
+    }
+
+    applySourceRelaysSafe();
+
+    if (!faultActive && simRun) {
+      accumulateEnergyCostSim((double)simDtHours, loadPower_W, price);
+    }
+  }
+}
